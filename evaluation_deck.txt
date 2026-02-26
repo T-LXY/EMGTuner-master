@@ -1,0 +1,39 @@
+Version Description:
+
+    v1: baseline attempt
+    v2: made changes to address overfitting and low class 7 accuracy found in v1
+    v3: same as v2 but dropped class 7 to investigate whether the lack of data for class 7 had a negative impact on overall model accuracy for the more documented labels
+
+Version Performace:
+    
+    v1: test loss = 0.9218 and test accuracy = 0.8330 (model predicts more correctly but is less confident)
+    v2: test loss = 0.5854 and test accuracy = 0.8112 (model predicts less correctly but is more confident)
+    v3: test loss = 0.5582 and test accuracy = 0.8214 (model slightly outperforms v2)
+
+Evaluatio Deck Recommendation:
+
+    Use v1 or v2 or both. Do not use v3 model. v3 only saw slight improvements to v2, meaning that class 7 was not the bottleneck and error comes from generalization issues.
+
+Are you using windowed date?
+
+    v1: yes
+    v2: yes
+    v3: yes
+
+If using windowed, what size windows?
+
+    v1: 250
+    v2: 250
+    v3: 250
+
+How do you calculate your loss?
+    
+    v1: Cross Entropy Loss
+    v2: Cross Entropy Loss
+    v3: Cross Entropy Loss
+
+How many epochs are you using for training?
+
+    v1: 30
+    v2: 17 (max 200 but early stop due to overfitting)
+    v3: 18 (max 200 but early stop due to overfitting)
