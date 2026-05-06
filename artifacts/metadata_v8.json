@@ -1,0 +1,35 @@
+{
+  "window_len": 600,
+  "step_size": 600,
+  "sample_rate_hz": 500,
+  "phase_seconds": 3,
+  "phase_samples": 1500,
+  "num_channels": 8,
+  "num_classes": 6,
+  "channel_columns": [
+    "FilteredChannel1",
+    "FilteredChannel2",
+    "FilteredChannel3",
+    "FilteredChannel4",
+    "FilteredChannel5",
+    "FilteredChannel6",
+    "FilteredChannel7",
+    "FilteredChannel8"
+  ],
+  "label_map": {
+    "Extend": 0,
+    "Fist": 1,
+    "Flex": 2,
+    "Radial": 3,
+    "Rest": 4,
+    "Ulnar": 5
+  },
+  "inverted_label_map": {
+    "0": "Extend",
+    "1": "Fist",
+    "2": "Flex",
+    "3": "Radial",
+    "4": "Rest",
+    "5": "Ulnar"
+  }
+}
