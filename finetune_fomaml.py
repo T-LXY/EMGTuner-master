@@ -1,5 +1,6 @@
 # AI SLOP CODE!!!
-
+# HAS OUTDATED FUNCTIONALITY WITH FILE "grab_subject_data.py"
+# This will be replaced with Tony code
 """
 finetune_fomaml.py
 ==================
@@ -81,16 +82,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-try:
-    from grab_subject_data import (
-        PreprocessingConfig,
-        preprocess_files,
-    )
-except ImportError as exc:
-    sys.exit(
-        "Could not import grab_subject_data.py.  Make sure it is in the same "
-        f"directory or on PYTHONPATH.\n  {exc}"
-    )
 
 
 # Pulled from v8, ENSURE KEEPS UP TO DATE!!!!!!!
