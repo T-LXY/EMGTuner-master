@@ -1,0 +1,15 @@
+{
+    "data_dir"              : "subject_data",
+    "model_path"            : "artifacts/best_model_v8.pt",
+    "model_metadata_path"   : "artifacts/metadata_v8.json",
+    "inner_lr"              : 0.01,
+    "inner_steps"           : 5,
+    "outer_lr"              : 1e-4,
+    "meta_epochs"           : 50,
+    "tasks_per_epoch"       : 8,
+    "k_shot"                : 5,
+    "q_query"               : 5,
+    "adapt_step"            : 10,
+    "adapt_lr"              : 1e-3,
+    "seed"                  : 2525
+}
