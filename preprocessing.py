@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-import json
-import math
 import re
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
@@ -10,480 +7,578 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
-@dataclass
-class PreprocessingConfig:
+def preprocess_mindrove_data(
+    root_dir: str | Path = "mindrove_data",
+    exclude_file_names: Optional[list[str] | set[str] | tuple[str, ...]] = None
+) -> dict:
     """
-    Stores configuration parameters for preprocessing and window creation.
+    Run the full preprocessing pipeline before train/validation/test splitting.
     """
 
-    # Windowing parameters
-    window_size: int = 150
-    step_size: int = 25
+    @dataclass
+    class PreprocessingConfig:
+        """
+        Stores preprocessing and windowing settings for the new Mindrove CSV files.
+        """
 
-    # Number of windows to extract from each cleaned phase
-    rest_windows_per_phase: int = 2
-    gesture_windows_per_phase: int = 3
+        # 200 samples at 500 Hz = 0.40 seconds of EMG history per prediction.
+        window_size: int = 200
 
-    # Dataset timing
-    sample_rate_hz: int = 500
-    phase_seconds: int = 3
+        # 25 samples at 500 Hz = one training window every 0.05 seconds.
+        step_size: int = 25
 
-    # Trim this many seconds from the start and end of each phase to avoid transition artifacts
-    boundary_trim_seconds: float = 0.4
+        # Mindrove armband sampling rate.
+        sample_rate_hz: int = 500
 
-    # Search a small positive offset at the beginning of each file to better align the repeating 3s gesture pattern
-    phase_offset_search_step: int = 25        
-    phase_offset_search_max_abs_seconds: float = 1.0
+        # Ignore labeled segments that are too short to be useful.
+        min_segment_seconds: float = 0.75
 
-    # Keep rows ordered by time
-    sort_by_time: bool = True
-
-
-cfg = PreprocessingConfig()
-
-# Calculate derived parameters
-phase_samples = cfg.sample_rate_hz * cfg.phase_seconds
-boundary_trim_samples = int(cfg.boundary_trim_seconds * cfg.sample_rate_hz)
-
-# Define the root directory containing the CSV files
-root_dir = Path("/Users/tonyliu/Documents/EMGTuner-master/subject_data")
-
-# Recursively find all CSV files in the root directory and its subdirectories
-DATA_FILES = sorted([file for file in root_dir.rglob("*.csv")])
-
-# Define columns and gestures to exclude from the dataset
-DROP_COLUMNS = {
-    "GyroX", "GyroY", "GyroZ",
-    "AccX", "AccY", "AccZ",
-    "PPG1", "PPG2",
-    "rawPPG1", "rawPPG2", "rawPPG3",
-    "Hr", "Hrv",
-    "Battery",
-    "Trigger", "PhysicalTrigger", "AutoTrigger"
-}
-EXCLUDED_GESTURES = {"2F", "3F"}
-
-# Print out the configuration and dataset information for verification
-print("Number of files found:", len(DATA_FILES))
-if len(DATA_FILES) > 0:
-    print("Example file:", DATA_FILES[0])
-print("Samples per 3-second phase:", phase_samples)
-print("Boundary trim per side:", boundary_trim_samples, "samples")
-
-def load_emg_file(path: str | Path) -> pd.DataFrame:
-    """
-    Load one EMG CSV file from the dataset.
-    """
-    path = Path(path)
-    df = pd.read_csv(path, sep="\t", engine="python")
-    return df
+        # Optional safety filter: remove non-Rest windows whose centered RMS energy is too close to Rest.
+        gesture_energy_multiplier: float = 1.10
+        use_gesture_energy_filter: bool = False
 
 
-def normalize_gesture_label(raw_label: str) -> str:
-    """
-    Normalize file-derived gesture labels.
-    """
-    label = str(raw_label).strip()
-    if label.lower().startswith("rest"):
-        return "Rest"
-    return label
+    cfg = PreprocessingConfig()
+
+    min_segment_samples = int(cfg.min_segment_seconds * cfg.sample_rate_hz)
+
+    root_dir = Path(root_dir)
+
+    DATA_FILES_ALL = sorted(root_dir.rglob("*.csv"))
+
+    exclude_file_names = set(exclude_file_names or [])
+
+    DATA_FILES = [
+        file
+        for file in DATA_FILES_ALL
+        if file.name not in exclude_file_names
+    ]
+
+    excluded_data_files = [
+        file
+        for file in DATA_FILES_ALL
+        if file.name in exclude_file_names
+    ]
+
+    # Label mapping for the new Mindrove row-level labels in the last CSV column.
+    SPEC_LABEL_MAP = {
+        "Extend": 0,
+        "Fist": 1,
+        "Flex": 2,
+        "Pro": 3,
+        "Radial": 4,
+        "Rest": 5,
+        "Sup": 6,
+        "Ulnar": 7,
+    }
+    SPEC_INDEX_TO_LABEL = {v: k for k, v in SPEC_LABEL_MAP.items()}
+
+    print("Number of CSV files found before exclusion:", len(DATA_FILES_ALL))
+    print("Number of CSV files excluded:", len(excluded_data_files))
+    print("Number of CSV files used:", len(DATA_FILES))
+
+    if len(excluded_data_files) > 0:
+        print("\nExcluded files:")
+        for file in excluded_data_files:
+            print(file)
+
+    if len(DATA_FILES) > 0:
+        print("\nExample file used:", DATA_FILES[0])
+
+    print("\nSample rate:", cfg.sample_rate_hz, "Hz")
+    print("Window size:", cfg.window_size, "samples =", cfg.window_size / cfg.sample_rate_hz, "seconds")
+    print("Step size:", cfg.step_size, "samples =", cfg.step_size / cfg.sample_rate_hz, "seconds")
 
 
-def parse_subject_and_gesture(path: str | Path) -> tuple[str, str]:
-    """
-    Parse subject ID and gesture label from the file path.
-    """
-    path = Path(path)
+    def load_mindrove_file(path: str | Path) -> pd.DataFrame:
+        """
+        Load one Mindrove CSV file.
+        """
+        path = Path(path)
 
-    subject_id = path.parent.name
-    stem = path.stem
+        df = pd.read_csv(
+            path,
+            header=None,
+            sep=r"\s+",
+            engine="python",
+            na_values=["nan", "NaN", "NULL", "None", ""]
+        )
 
-    parts = stem.split("_")
-    if len(parts) < 2:
-        raise ValueError(f"Could not parse gesture from filename: {path.name}")
+        df = df.dropna(how="all").reset_index(drop=True)
 
-    gesture_parts = parts[1:]
+        if df.shape[1] < 2:
+            raise ValueError(f"{path} must contain at least one channel column and one label column.")
 
-    if len(gesture_parts) >= 2 and gesture_parts[-1].lower() == "3s":
-        gesture_parts = gesture_parts[:-1]
+        num_channels = df.shape[1] - 1
+        channel_cols = [f"Channel{i + 1}" for i in range(num_channels)]
+        label_col = "label_value"
 
-    if len(gesture_parts) == 0:
-        raise ValueError(f"Could not parse gesture from filename: {path.name}")
+        df.columns = channel_cols + [label_col]
 
-    gesture_label = "_".join(gesture_parts)
-    gesture_label = normalize_gesture_label(gesture_label)
+        for col in channel_cols + [label_col]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return subject_id, gesture_label
+        bad_channel_rows = df[channel_cols].isna().any(axis=1).sum()
+        if bad_channel_rows > 0:
+            raise ValueError(
+                f"{path} has {bad_channel_rows} rows with missing/non-numeric channel values. "
+                "The label column may be NaN, but channel columns should not be NaN."
+            )
+
+        return df
 
 
-def infer_filtered_channel_cols(df: pd.DataFrame) -> list[str]:
-    """
-    Dynamically find filtered EMG columns
-    """
-    filtered_cols = [col for col in df.columns if col.lower().startswith("filteredchannel")]
+    def label_value_to_name(value) -> object:
+        """
+        Convert numeric labels such as 0.0, 1.0, ..., 7.0 into class names.
+        """
+        if pd.isna(value):
+            return np.nan
 
-    def sort_key(name: str):
-        m = re.search(r"(\d+)$", name)
-        return int(m.group(1)) if m else float("inf")
+        value_float = float(value)
+        label_id = int(value_float) if value_float.is_integer() else value_float
 
-    filtered_cols = sorted(filtered_cols, key=sort_key)
+        return SPEC_INDEX_TO_LABEL.get(label_id, f"Label_{label_id}")
 
-    if len(filtered_cols) == 0:
+
+    def infer_subject_id(path: str | Path, root_dir: str | Path) -> str:
+        """
+        Infer subject ID if files are stored in subject subfolders.
+        """
+        path = Path(path)
+        root_dir = Path(root_dir)
+
+        try:
+            rel = path.relative_to(root_dir)
+            if len(rel.parts) > 1:
+                return rel.parts[0]
+        except ValueError:
+            pass
+
+        return "unknown_subject"
+
+
+    def infer_channel_cols(df: pd.DataFrame) -> list[str]:
+        """
+        Dynamically find channel columns.
+        """
+        channel_cols = [col for col in df.columns if re.fullmatch(r"Channel\d+", str(col))]
+
+        def sort_key(name: str):
+            m = re.search(r"(\d+)$", name)
+            return int(m.group(1)) if m else float("inf")
+
+        return sorted(channel_cols, key=sort_key)
+
+
+    all_dfs = []
+    schemas = []
+
+    for file in DATA_FILES:
+        df = load_mindrove_file(file)
+        file_channel_cols = infer_channel_cols(df)
+
+        df["label"] = df["label_value"].apply(label_value_to_name)
+        df["source_file"] = str(file)
+        df["source_index"] = np.arange(len(df), dtype=np.int64)
+        df["time_seconds"] = df["source_index"] / cfg.sample_rate_hz
+        df["subject_id"] = infer_subject_id(file, root_dir)
+
+        df = df[
+            ["source_file", "subject_id", "source_index", "time_seconds"]
+            + file_channel_cols
+            + ["label_value", "label"]
+        ].copy()
+
+        all_dfs.append(df)
+
+        schemas.append({
+            "file": str(file),
+            "subject_id": df["subject_id"].iloc[0],
+            "num_rows": len(df),
+            "n_channels": len(file_channel_cols),
+            "channels": file_channel_cols,
+            "labeled_rows": int(df["label"].notna().sum()),
+            "pause_rows": int(df["label"].isna().sum()),
+        })
+
+    if len(all_dfs) == 0:
+        raise FileNotFoundError(
+            f"No CSV files found under {root_dir.resolve()} after exclusions. "
+            "Set root_dir to your mindrove_data folder or remove file names from exclude_file_names."
+        )
+
+    raw_df = pd.concat(all_dfs, ignore_index=True)
+    schemas_df = pd.DataFrame(schemas)
+
+    channel_cols = infer_channel_cols(raw_df)
+
+    if len(channel_cols) == 0:
+        raise ValueError("No channel columns were detected.")
+
+    channel_counts = schemas_df["n_channels"].unique()
+    if len(channel_counts) != 1:
         raise ValueError(
-            "No filtered EMG columns found. Expected columns like FilteredChannel1, FilteredChannel2, ..."
+            "Not all files have the same number of channels. "
+            f"Detected channel counts: {sorted(channel_counts.tolist())}"
         )
 
-    return filtered_cols
+    print("\nraw_df shape:", raw_df.shape)
+    print("Detected EMG channels:", channel_cols)
+    print("Detected number of channels:", len(channel_cols))
+
+    print("\nLabel distribution including NaN pauses:")
+    print(raw_df["label"].value_counts(dropna=False).sort_index())
 
 
-all_dfs = []
-schemas = []
+    filtered_df = raw_df.copy()
 
-for file in DATA_FILES:
-    df = load_emg_file(file)
-    subject_id, file_gesture_label = parse_subject_and_gesture(file)
+    print("Using new Mindrove row-level labels from the last CSV column.")
+    print("NaN labels are pause/unmarked rows and will be ignored during window creation.")
+    print("Using known Mindrove sampling rate:", cfg.sample_rate_hz, "Hz")
+    print("Window size:", cfg.window_size, "samples =", cfg.window_size / cfg.sample_rate_hz, "seconds")
+    print("Step size:", cfg.step_size, "samples =", cfg.step_size / cfg.sample_rate_hz, "seconds")
 
-    if file_gesture_label in EXCLUDED_GESTURES:
-        continue
-
-    cols_to_drop = [col for col in DROP_COLUMNS if col in df.columns]
-    if len(cols_to_drop) > 0:
-        df = df.drop(columns=cols_to_drop)
-
-    channel_cols = infer_filtered_channel_cols(df)
-
-    keep_cols = channel_cols.copy()
-    if "Timestamp" in df.columns:
-        keep_cols = ["Timestamp"] + keep_cols
-
-    df = df[keep_cols].copy()
-
-    if "Timestamp" in df.columns:
-        df = df.rename(columns={"Timestamp": "time"})
-    else:
-        df["time"] = np.arange(len(df), dtype=np.int64)
-
-    df = df[["time"] + channel_cols].copy()
-
-    df["source_file"] = str(file)
-    df["subject_id"] = subject_id
-    df["file_gesture_label"] = file_gesture_label
-    df["source_index"] = np.arange(len(df), dtype=np.int64)
-
-    if cfg.sort_by_time and "time" in df.columns:
-        df = df.sort_values("time", kind="mergesort").reset_index(drop=True)
-
-    all_dfs.append(df)
-
-    schemas.append({
-        "file": str(file),
-        "subject_id": subject_id,
-        "file_gesture_label": file_gesture_label,
-        "num_rows": len(df),
-        "n_channels": len(channel_cols),
-        "channels": channel_cols,
-        "time_dtype": str(df["time"].dtype),
-    })
-
-raw_df = pd.concat(all_dfs, ignore_index=True)
-schemas_df = pd.DataFrame(schemas)
-
-channel_cols = infer_filtered_channel_cols(raw_df)
-
-print("raw_df shape:", raw_df.shape)
-print("Detected filtered EMG channels:", channel_cols)
-print("Unique file-level labels:", sorted(raw_df["file_gesture_label"].unique().tolist()))
-display(schemas_df.head())
-display(raw_df.head())
-
-filtered_df = raw_df.copy()
-
-print("Using pre-filtered EMG channels from the files.")
-print("Using known device sampling rate:", cfg.sample_rate_hz, "Hz")
-print("Samples per 3-second phase:", phase_samples)
-print("Boundary trim per side:", boundary_trim_samples, "samples")
-
-def get_phase_label(file_gesture_label: str, phase_index: int) -> str:
-    """
-    Determine the label of a 3-second phase inside a file.
-    """
-    file_gesture_label = normalize_gesture_label(file_gesture_label)
-
-    if file_gesture_label == "Rest":
-        return "Rest"
-
-    return "Rest" if phase_index % 2 == 0 else file_gesture_label
+    print("\nRows:")
+    print("Total rows:", len(filtered_df))
+    print("Labeled rows:", int(filtered_df["label"].notna().sum()))
+    print("Pause/unmarked rows:", int(filtered_df["label"].isna().sum()))
 
 
-def compute_emg_energy(segment: np.ndarray) -> float:
-    """
-    Compute average RMS energy for an EMG segment/window.
-    Higher values usually indicate stronger muscle activation.
-    """
-    if len(segment) == 0:
-        return 0.0
+    def report_label_column(df: pd.DataFrame):
+        """
+        Verify the new row-level label column.
+        """
+        labeled = df[df["label_value"].notna()].copy()
+        pause = df[df["label_value"].isna()].copy()
 
-    rms_per_channel = np.sqrt(np.mean(np.square(segment), axis=0))
-    return float(np.mean(rms_per_channel))
+        print("Total rows:", len(df))
+        print("Labeled rows used for possible training windows:", len(labeled))
+        print("Pause/unmarked rows ignored:", len(pause))
 
+        seen_values = sorted(labeled["label_value"].unique().tolist())
+        print("Numeric labels present:", seen_values)
 
-def compute_phase_energy(segment: np.ndarray) -> float:
-    return compute_emg_energy(segment)
+        print("\nDecoded label distribution:")
+        print(labeled["label"].value_counts().sort_index())
 
+        known_ids = set(SPEC_INDEX_TO_LABEL.keys())
+        seen_ids = set()
 
-def find_best_phase_offset(
-    df: pd.DataFrame,
-    channel_cols: list[str],
-    phase_samples: int,
-    cfg: PreprocessingConfig
-) -> int:
-    """
-    Search a small positive offset to better align the repeating
-    3s rest / 3s gesture structure.
-    """
-    file_gesture_label = normalize_gesture_label(str(df["file_gesture_label"].iloc[0]))
-    if file_gesture_label == "Rest":
-        return 0
+        for value in seen_values:
+            value_float = float(value)
+            seen_ids.add(int(value_float) if value_float.is_integer() else value_float)
 
-    data = df[channel_cols].to_numpy(dtype=np.float32)
-    n = len(data)
+        unknown_ids = sorted(seen_ids - known_ids, key=lambda x: str(x))
 
-    max_offset = min(
-        int(cfg.phase_offset_search_max_abs_seconds * cfg.sample_rate_hz),
-        max(0, phase_samples - 1)
-    )
-
-    candidate_offsets = list(range(0, max_offset + 1, cfg.phase_offset_search_step))
-    if len(candidate_offsets) == 0:
-        return 0
-
-    best_offset = 0
-    best_score = -np.inf
-
-    for offset in candidate_offsets:
-        num_complete_phases = (n - offset) // phase_samples
-        if num_complete_phases < 2:
-            continue
-
-        energies = []
-        for phase_idx in range(num_complete_phases):
-            start = offset + phase_idx * phase_samples
-            end = start + phase_samples
-            segment = data[start:end]
-            energies.append(compute_phase_energy(segment))
-
-        rest_energies = np.array(energies[0::2], dtype=np.float32)
-        gesture_energies = np.array(energies[1::2], dtype=np.float32)
-
-        if len(rest_energies) == 0 or len(gesture_energies) == 0:
-            continue
-
-        score = float(np.mean(gesture_energies) - np.mean(rest_energies))
-
-        if score > best_score:
-            best_score = score
-            best_offset = offset
-
-    return int(best_offset)
+        if len(unknown_ids) > 0:
+            print("\nWarning: these label IDs were not in SPEC_LABEL_MAP and were named automatically:")
+            print(unknown_ids)
+        else:
+            print("\nAll non-NaN label IDs were found in SPEC_LABEL_MAP.")
 
 
-def split_file_into_phases(
-    df: pd.DataFrame,
-    channel_cols: list[str],
-    phase_samples: int,
-    cfg: PreprocessingConfig
-) -> List[pd.DataFrame]:
-    """
-    Split one file into consecutive 3-second phases after first estimating a small alignment offset.
-    """
-    phases = []
-
-    file_gesture_label = normalize_gesture_label(str(df["file_gesture_label"].iloc[0]))
-    subject_id = str(df["subject_id"].iloc[0])
-    source_file = str(df["source_file"].iloc[0])
-
-    best_offset = find_best_phase_offset(df, channel_cols, phase_samples, cfg)
-
-    n = len(df)
-    num_complete_phases = (n - best_offset) // phase_samples
-
-    for phase_idx in range(num_complete_phases):
-        start = best_offset + phase_idx * phase_samples
-        end = start + phase_samples
-
-        phase = df.iloc[start:end].copy().reset_index(drop=True)
-        phase["label"] = get_phase_label(file_gesture_label, phase_idx)
-        phase["phase_index"] = phase_idx
-        phase["subject_id"] = subject_id
-        phase["source_file"] = source_file
-        phase["file_gesture_label"] = file_gesture_label
-        phase["best_offset"] = best_offset
-
-        phases.append(phase)
-
-    return phases
+    report_label_column(filtered_df)
 
 
-def make_windows_from_phase(
-    phase_df: pd.DataFrame,
-    channel_cols: list[str],
-    cfg: PreprocessingConfig,
-    rest_energy_threshold: float | None = None,
-    gesture_energy_multiplier: float = 1.10
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Create windows from the stable middle part of a phase.
+    def compute_emg_energy(segment: np.ndarray) -> float:
+        """
+        Compute centered RMS energy for an EMG window.
+        """
+        if len(segment) == 0:
+            return 0.0
 
-    Important real-time choice:
-    - Do NOT only take the highest-energy gesture windows.
-    - Instead, take evenly spaced windows across the cleaned phase.
-    - Then remove only gesture windows that look too much like Rest.
+        segment = segment.astype(np.float32)
+        centered = segment - np.mean(segment, axis=0, keepdims=True)
+        rms_per_channel = np.sqrt(np.mean(np.square(centered), axis=0))
+        return float(np.mean(rms_per_channel))
 
-    This teaches the model realistic gesture variation instead of only perfect,
-    maximum-contraction examples.
-    """
-    trim = int(cfg.boundary_trim_seconds * cfg.sample_rate_hz)
 
-    if len(phase_df) <= 2 * trim:
-        return (
-            np.empty((0, cfg.window_size, len(channel_cols)), dtype=np.float32),
-            np.empty((0,), dtype=object)
-        )
+    def add_labeled_segment_ids(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Assign a segment ID to each contiguous non-NaN labeled region.
+        """
+        df = df.copy()
 
-    core_df = phase_df.iloc[trim: len(phase_df) - trim].reset_index(drop=True)
-    data = core_df[channel_cols].to_numpy(dtype=np.float32)
-    label = str(core_df["label"].iloc[0])
+        segment_ids = []
+        current_segment_id = -1
+        previous_label = None
 
-    T, C = data.shape
-
-    if T < cfg.window_size:
-        return (
-            np.empty((0, cfg.window_size, C), dtype=np.float32),
-            np.empty((0,), dtype=object)
-        )
-
-    max_start = T - cfg.window_size
-
-    if label == "Rest":
-        num_windows = cfg.rest_windows_per_phase
-    else:
-        num_windows = cfg.gesture_windows_per_phase
-
-    if num_windows <= 1:
-        candidate_starts = [(T - cfg.window_size) // 2]
-    else:
-        candidate_starts = np.linspace(
-            0,
-            max_start,
-            num=num_windows,
-            dtype=int
-        ).tolist()
-
-    starts = []
-
-    for s in candidate_starts:
-        window = data[s:s + cfg.window_size]
-        energy = compute_emg_energy(window)
-
-        if label != "Rest" and rest_energy_threshold is not None:
-            if energy < gesture_energy_multiplier * rest_energy_threshold:
+        for label in df["label"].tolist():
+            if pd.isna(label):
+                segment_ids.append(np.nan)
+                previous_label = None
                 continue
 
-        starts.append(s)
+            if previous_label is None or label != previous_label:
+                current_segment_id += 1
 
-    if len(starts) == 0:
-        return (
-            np.empty((0, cfg.window_size, C), dtype=np.float32),
-            np.empty((0,), dtype=object)
+            segment_ids.append(current_segment_id)
+            previous_label = label
+
+        df["segment_id"] = segment_ids
+        return df
+
+
+    def extract_labeled_segments(
+        df: pd.DataFrame,
+        channel_cols: list[str],
+        cfg: PreprocessingConfig
+    ) -> list[pd.DataFrame]:
+        """
+        Extract contiguous labeled gesture/rest segments from one file.
+        Pause rows with NaN labels are ignored.
+        """
+        df = add_labeled_segment_ids(df)
+
+        segments = []
+
+        labeled_df = df[df["segment_id"].notna()].copy()
+        if len(labeled_df) == 0:
+            return segments
+
+        for segment_id, segment_df in labeled_df.groupby("segment_id", sort=True):
+            segment_df = segment_df.reset_index(drop=True)
+
+            if len(segment_df) < min_segment_samples:
+                continue
+
+            segment_df["segment_id"] = int(segment_id)
+            segment_df["segment_label"] = str(segment_df["label"].iloc[0])
+
+            segments.append(segment_df)
+
+        return segments
+
+
+    def window_start_indices(length: int, window_size: int, step_size: int) -> list[int]:
+        """
+        Return sliding-window start indices for one segment.
+        """
+        if length < window_size:
+            return []
+
+        return list(range(0, length - window_size + 1, step_size))
+
+
+    def make_windows_from_segment(
+        segment_df: pd.DataFrame,
+        channel_cols: list[str],
+        cfg: PreprocessingConfig,
+        rest_energy_threshold: float | None = None,
+        gesture_energy_multiplier: float = 1.10
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create sliding windows from one labeled segment.
+
+        Each output window has shape:
+        (window_size, num_channels)
+        """
+        data = segment_df[channel_cols].to_numpy(dtype=np.float32)
+        label = str(segment_df["label"].iloc[0])
+
+        T, C = data.shape
+
+        starts = window_start_indices(T, cfg.window_size, cfg.step_size)
+
+        if len(starts) == 0:
+            return (
+                np.empty((0, cfg.window_size, C), dtype=np.float32),
+                np.empty((0,), dtype=object)
+            )
+
+        kept_starts = []
+
+        for s in starts:
+            window = data[s:s + cfg.window_size]
+
+            # Optional filter for mislabeled gesture windows that look too much like Rest.
+            # This does not apply to the actual Rest class.
+            if label != "Rest" and rest_energy_threshold is not None:
+                energy = compute_emg_energy(window)
+                if energy < gesture_energy_multiplier * rest_energy_threshold:
+                    continue
+
+            kept_starts.append(s)
+
+        if len(kept_starts) == 0:
+            return (
+                np.empty((0, cfg.window_size, C), dtype=np.float32),
+                np.empty((0,), dtype=object)
+            )
+
+        X = np.stack(
+            [data[s:s + cfg.window_size] for s in kept_starts],
+            axis=0
+        ).astype(np.float32)
+
+        y = np.array([label] * len(kept_starts), dtype=object)
+
+        return X, y
+
+
+    all_segments = []
+
+    for source_file, sub in filtered_df.groupby("source_file", sort=False):
+        sub = sub.reset_index(drop=True)
+        file_segments = extract_labeled_segments(sub, channel_cols, cfg)
+        all_segments.extend(file_segments)
+
+    print("Number of labeled segments found:", len(all_segments))
+
+    segment_summary = pd.DataFrame([
+        {
+            "source_file": segment_df["source_file"].iloc[0],
+            "segment_id": int(segment_df["segment_id"].iloc[0]),
+            "label": segment_df["segment_label"].iloc[0],
+            "samples": len(segment_df),
+            "seconds": len(segment_df) / cfg.sample_rate_hz,
+        }
+        for segment_df in all_segments
+    ])
+
+    # Optional Rest-energy filter.
+    # If this filter is enabled, subtle gesture windows can be removed before training.
+    # That can make the training data too different from validation/test data and can make the model worse at recognizing weak gestures.
+    rest_energy_threshold = None
+
+    if cfg.use_gesture_energy_filter:
+        rest_window_energies = []
+
+        for segment_df in all_segments:
+            label = str(segment_df["segment_label"].iloc[0])
+
+            if label != "Rest":
+                continue
+
+            data = segment_df[channel_cols].to_numpy(dtype=np.float32)
+            starts = window_start_indices(len(data), cfg.window_size, cfg.step_size)
+
+            for s in starts:
+                window = data[s:s + cfg.window_size]
+                rest_window_energies.append(compute_emg_energy(window))
+
+        if len(rest_window_energies) > 0:
+            rest_energy_threshold = float(np.percentile(rest_window_energies, 95))
+        else:
+            rest_energy_threshold = None
+
+        print("\nRest windows used to estimate threshold:", len(rest_window_energies))
+        print("95th percentile Rest energy threshold:", rest_energy_threshold)
+    else:
+        print("\nGesture energy filter disabled.")
+        print("No gesture windows will be removed for looking too similar to Rest.")
+
+
+    X_list = []
+    y_list = []
+    file_list = []
+    subject_list = []
+
+    dropped_segment_count = 0
+    kept_window_count = 0
+
+    for segment_df in all_segments:
+        expected_label = str(segment_df["segment_label"].iloc[0])
+
+        X_segment, y_segment = make_windows_from_segment(
+            segment_df,
+            channel_cols,
+            cfg,
+            rest_energy_threshold=rest_energy_threshold,
+            gesture_energy_multiplier=cfg.gesture_energy_multiplier
         )
 
-    X = np.stack([data[s:s + cfg.window_size] for s in starts], axis=0).astype(np.float32)
-    y = np.array([label] * len(starts), dtype=object)
+        if len(y_segment) == 0:
+            if expected_label != "Rest":
+                dropped_segment_count += 1
+            continue
 
-    return X, y
+        kept_window_count += len(y_segment)
+
+        X_list.append(X_segment)
+        y_list.append(y_segment)
+        file_list.extend([segment_df["source_file"].iloc[0]] * len(y_segment))
+        subject_list.extend([segment_df["subject_id"].iloc[0]] * len(y_segment))
+
+    if len(X_list) == 0:
+        raise RuntimeError(
+            "No training windows were created. Try reducing window_size, "
+            "reducing step_size, lowering min_segment_seconds, or disabling the Rest-energy filter."
+        )
+
+    print("\nNon-Rest segments dropped because all windows looked too much like Rest:", dropped_segment_count)
+    print("Total windows kept:", kept_window_count)
+
+    X = np.concatenate(X_list, axis=0)
+    y = np.concatenate(y_list, axis=0)
+    files = np.array(file_list)
+    subjects = np.array(subject_list)
+
+    print(f"\nFinal dataset shape: X={X.shape}, y={y.shape}")
+    print("Window label distribution:")
+    print(pd.Series(y).value_counts().sort_index())
+    print("Number of unique files:", len(np.unique(files)))
+    print("Number of unique subjects:", len(np.unique(subjects)))
+
+    return {
+        # Main variables used immediately after preprocessing.
+        "X": X,
+        "y": y,
+        "files": files,
+        "subjects": subjects,
+
+        # DataFrames and summaries.
+        "raw_df": raw_df,
+        "filtered_df": filtered_df,
+        "schemas_df": schemas_df,
+        "segment_summary": segment_summary,
+
+        # Configuration and file information.
+        "cfg": cfg,
+        "PreprocessingConfig": PreprocessingConfig,
+        "root_dir": root_dir,
+        "DATA_FILES": DATA_FILES,
+        "DATA_FILES_ALL": DATA_FILES_ALL,
+        "excluded_data_files": excluded_data_files,
+        "min_segment_samples": min_segment_samples,
+
+        # Label and channel metadata needed later.
+        "SPEC_LABEL_MAP": SPEC_LABEL_MAP,
+        "SPEC_INDEX_TO_LABEL": SPEC_INDEX_TO_LABEL,
+        "channel_cols": channel_cols,
+
+        # Segment/window metadata.
+        "all_segments": all_segments,
+        "rest_energy_threshold": rest_energy_threshold,
+        "dropped_segment_count": dropped_segment_count,
+        "kept_window_count": kept_window_count,
+
+        # Intermediate lists, returned for debugging/reproducibility.
+        "X_list": X_list,
+        "y_list": y_list,
+        "file_list": file_list,
+        "subject_list": subject_list,
+
+        # Helper functions, returned so later code still has access to them.
+        "load_mindrove_file": load_mindrove_file,
+        "label_value_to_name": label_value_to_name,
+        "infer_subject_id": infer_subject_id,
+        "infer_channel_cols": infer_channel_cols,
+        "report_label_column": report_label_column,
+        "compute_emg_energy": compute_emg_energy,
+        "add_labeled_segment_ids": add_labeled_segment_ids,
+        "extract_labeled_segments": extract_labeled_segments,
+        "window_start_indices": window_start_indices,
+        "make_windows_from_segment": make_windows_from_segment,
+    }
 
 
-all_phases = []
+preprocessed = preprocess_mindrove_data(
+    root_dir="mindrove_data",
+    exclude_file_names=[]
+)
 
-for source_file, sub in filtered_df.groupby("source_file", sort=False):
-    sub = sub.reset_index(drop=True)
-    phases = split_file_into_phases(sub, channel_cols, phase_samples, cfg)
-    all_phases.extend(phases)
-
-print("Number of 3-second phases found:", len(all_phases))
-
-rest_window_energies = []
-
-for phase_df in all_phases:
-    label = str(phase_df["label"].iloc[0])
-
-    if label != "Rest":
-        continue
-
-    trim = int(cfg.boundary_trim_seconds * cfg.sample_rate_hz)
-
-    if len(phase_df) <= 2 * trim:
-        continue
-
-    core_df = phase_df.iloc[trim: len(phase_df) - trim].reset_index(drop=True)
-    data = core_df[channel_cols].to_numpy(dtype=np.float32)
-
-    if len(data) < cfg.window_size:
-        continue
-
-    start = (len(data) - cfg.window_size) // 2
-    window = data[start:start + cfg.window_size]
-
-    rest_window_energies.append(compute_emg_energy(window))
-
-rest_energy_threshold = np.percentile(rest_window_energies, 95)
-
-print("Rest windows used to estimate threshold:", len(rest_window_energies))
-print("95th percentile Rest energy threshold:", rest_energy_threshold)
-
-X_list = []
-y_list = []
-file_list = []
-subject_list = []
-
-dropped_phase_count = 0
-kept_window_count = 0
-
-for phase_df in all_phases:
-    expected_label = str(phase_df["label"].iloc[0])
-
-    X_phase, y_phase = make_windows_from_phase(
-        phase_df,
-        channel_cols,
-        cfg,
-        rest_energy_threshold=rest_energy_threshold,
-        gesture_energy_multiplier=1.10
-    )
-
-    if len(y_phase) == 0:
-        if expected_label != "Rest":
-            dropped_phase_count += 1
-        continue
-
-    kept_window_count += len(y_phase)
-
-    X_list.append(X_phase)
-    y_list.append(y_phase)
-    file_list.extend([phase_df["source_file"].iloc[0]] * len(y_phase))
-    subject_list.extend([phase_df["subject_id"].iloc[0]] * len(y_phase))
-
-print("Gesture phases dropped because they looked too much like Rest:", dropped_phase_count)
-print("Total windows kept:", kept_window_count)
-
-X = np.concatenate(X_list, axis=0)
-y = np.concatenate(y_list, axis=0)
-files = np.array(file_list)
-subjects = np.array(subject_list)
-
-print(f"Final dataset shape: X={X.shape}, y={y.shape}")
-print("Window label distribution:")
-print(pd.Series(y).value_counts().sort_index())
-print("Number of unique subjects:", len(np.unique(subjects)))
+globals().update(preprocessed)

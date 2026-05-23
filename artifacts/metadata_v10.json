@@ -1,0 +1,119 @@
+{
+  "window_size": 200,
+  "step_size": 25,
+  "sample_rate_hz": 500,
+  "min_segment_seconds": 0.75,
+  "num_raw_channels": 8,
+  "num_model_input_features": 16,
+  "num_classes": 8,
+  "raw_channel_columns": [
+    "Channel1",
+    "Channel2",
+    "Channel3",
+    "Channel4",
+    "Channel5",
+    "Channel6",
+    "Channel7",
+    "Channel8"
+  ],
+  "engineered_feature_names": [
+    "Channel1",
+    "Channel2",
+    "Channel3",
+    "Channel4",
+    "Channel5",
+    "Channel6",
+    "Channel7",
+    "Channel8",
+    "Channel1_delta",
+    "Channel2_delta",
+    "Channel3_delta",
+    "Channel4_delta",
+    "Channel5_delta",
+    "Channel6_delta",
+    "Channel7_delta",
+    "Channel8_delta"
+  ],
+  "feature_engineering": {
+    "remove_window_dc_offset": true,
+    "add_delta_features": true
+  },
+  "label_map": {
+    "Extend": 0,
+    "Fist": 1,
+    "Flex": 2,
+    "Pro": 3,
+    "Radial": 4,
+    "Rest": 5,
+    "Sup": 6,
+    "Ulnar": 7
+  },
+  "inverted_label_map": {
+    "0": "Extend",
+    "1": "Fist",
+    "2": "Flex",
+    "3": "Pro",
+    "4": "Radial",
+    "5": "Rest",
+    "6": "Sup",
+    "7": "Ulnar"
+  },
+  "raw_spec_label_map": {
+    "Extend": 0,
+    "Fist": 1,
+    "Flex": 2,
+    "Pro": 3,
+    "Radial": 4,
+    "Rest": 5,
+    "Sup": 6,
+    "Ulnar": 7
+  },
+  "split_group_name": "source_file",
+  "channel_mean": [
+    -2.2562135200132616e-05,
+    -2.056811354123056e-05,
+    -4.008084943052381e-06,
+    3.388740515219979e-05,
+    -9.689700164017268e-06,
+    9.724450501380488e-05,
+    -1.0648847819538787e-05,
+    -7.948076017783023e-06,
+    0.4911661148071289,
+    -0.011800535023212433,
+    -0.08037097007036209,
+    -0.06681600958108902,
+    -0.09873779118061066,
+    -0.12540459632873535,
+    -0.20253531634807587,
+    -0.006005008239299059
+  ],
+  "channel_std": [
+    939.9639282226562,
+    64.4369125366211,
+    70.32238006591797,
+    102.73607635498047,
+    168.22476196289062,
+    190.44500732421875,
+    230.51136779785156,
+    133.44361877441406,
+    65.2059326171875,
+    62.25019454956055,
+    72.54779815673828,
+    77.90699768066406,
+    102.0621109008789,
+    125.46758270263672,
+    35.52862548828125,
+    34.05629348754883
+  ],
+  "model_config": {
+    "conv_channels": [
+      64,
+      128
+    ],
+    "kernel_size": 7,
+    "lstm_hidden_size": 128,
+    "lstm_num_layers": 1,
+    "dropout": 0.15,
+    "bidirectional": true
+  }
+}
