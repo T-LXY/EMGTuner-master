@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-# Pulled directly from V9
+# Pulled directly from cnn_lstm
 class CNNLSTMClassifier(nn.Module):
     def __init__(
         self,
@@ -106,5 +106,3 @@ class CNNLSTMClassifier(nn.Module):
 
         logits = self.head(features)
         return logits
-    
-    

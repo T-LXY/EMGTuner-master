@@ -6,17 +6,14 @@ import random
 
 
 # ─────────────────────────────────────────────
-#  Task Definition  (unchanged)
+#  Task Definition
 # ─────────────────────────────────────────────
 class Task:
     """
-    One FOMAML task = N gesture classes × K support windows + Q query windows.
-
-    Attributes:
-        support_X : (N * K_shot,  timesteps, channels)
-        support_y : (N * K_shot,)
-        query_X   : (N * Q_query, timesteps, channels)
-        query_y   : (N * Q_query,)
+    One FOMAML task = 
+        N gesture classes 
+        K support windows 
+        Q query windows
     """
     def __init__(
         self,
@@ -57,129 +54,108 @@ class FOMAMLTaskSampler:
     """
     N-way K-shot episodic sampler for FOMAML.
 
-    Tasks are subject-agnostic — windows are pooled across ALL subjects
-    and sampled purely by gesture class. Each epoch exhausts the pool
-    without replacement, then resets.
+    pre-windowed X/y arrays
+    pooled by gesture class
+    EXHAUSTS task, does not reuse
 
-    Episode construction per task:
-        • N gesture classes are selected (all classes if n_way == None)
-        • K windows sampled per class  → support set  (inner loop)
-        • Q windows sampled per class  → query set    (outer / meta-gradient)
-        • Total windows per task: N * (K + Q)
-
-    Args
-    ----
-    df            : general pool  — grab_data(..., ignore=tune_subject)
-    df_sub        : tune pool     — grab_data(tune_folder)
-    signal_col    : column holding the pre-windowed (timesteps, channels) array
-    label_col     : gesture label column
-    n_way         : number of gesture classes per task (None = use all)
-    k_shot        : support windows per class
-    q_query       : query windows per class
-    seed          : reproducibility
+    n_way = gesture classes per task (None = all classes)
     """
 
     def __init__(
         self,
-        df,
-        df_sub,
-        signal_col: str         = "signal",
-        label_col:  str         = "label",
-        n_way:      Optional[int] = None,
-        k_shot:     int         = 5,
-        q_query:    int         = 5,
-        seed:       Optional[int] = 42,
+        X_train:   np.ndarray,
+        y_train:   np.ndarray,
+        X_tune:    np.ndarray,
+        y_tune:    np.ndarray,
+        cfg,
+        n_way:     Optional[int] = None,
     ):
-        self.signal_col = signal_col
-        self.label_col  = label_col
-        self.n_way      = n_way
-        self.k_shot     = k_shot
-        self.q_query    = q_query
+        self.k_shot  = cfg.k_shot
+        self.q_query = cfg.q_query
+        self.n_way   = n_way
 
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
 
-        # Pool all windows across subjects, indexed by class
-        self._meta_train_pool = self._build_class_pool(df,     pool="meta_train")
-        self._meta_tune_pool  = self._build_class_pool(df_sub, pool="meta_tune")
+        self.classes_    = np.unique(np.concatenate([y_train, y_tune]))
+        self._label2idx  = {c: i for i, c in enumerate(self.classes_)}
+        self.n_classes_  = len(self.classes_)
 
-        # Per-epoch availability tracker (without-replacement)
+        y_train_enc = np.array([self._label2idx[c] for c in y_train], dtype=np.int64)
+        y_tune_enc  = np.array([self._label2idx[c] for c in y_tune],  dtype=np.int64)
+
+        self._meta_train_pool = self._build_class_pool(X_train, y_train_enc, pool="meta_train")
+        self._meta_tune_pool  = self._build_class_pool(X_tune,  y_tune_enc,  pool="meta_tune")
+
         self._train_available: dict[int, list[int]] = {}
         self._tune_available:  dict[int, list[int]] = {}
         self._reset_availability("train")
         self._reset_availability("tune")
 
-        # Auto-resolve n_way
-        self._n_way_train = n_way or len(self._meta_train_pool)
-        self._n_way_tune  = n_way or len(self._meta_tune_pool)
-
+        self._n_way_train  = n_way or len(self._meta_train_pool)
+        self._n_way_tune   = n_way or len(self._meta_tune_pool)
         self._task_counter = 0
 
-        print(f"[TaskSampler] meta-train | classes: {len(self._meta_train_pool)} "
+        print(f"[TaskSampler] classes      : {list(self.classes_)}")
+        print(f"[TaskSampler] meta-train   | classes: {len(self._meta_train_pool)} "
               f"| total windows: {sum(len(v) for v in self._meta_train_pool.values())}")
-        print(f"[TaskSampler] meta-tune  | classes: {len(self._meta_tune_pool)} "
+        print(f"[TaskSampler] meta-tune    | classes: {len(self._meta_tune_pool)} "
               f"| total windows: {sum(len(v) for v in self._meta_tune_pool.values())}")
-        print(f"[TaskSampler] episode    | {self._n_way_train}-way {k_shot}-shot "
-              f"+ {q_query}-query per class")
+        print(f"[TaskSampler] episode      | {self._n_way_train}-way {self.k_shot}-shot "
+              f"+ {self.q_query}-query per class")
 
-    # ── internals ─────────────────────────────────────────────────────────────
 
     def _build_class_pool(
-        self, df, pool: str
+        self, X: np.ndarray, y: np.ndarray, pool: str
     ) -> dict[int, np.ndarray]:
-        """
-        Returns { label -> X_windows (N_windows, timesteps, channels) }
-        pooled across ALL subjects in df.
-        """
+        """{ encoded_label -> (N_windows, timesteps, channels) }"""
         class_pool = {}
-        for label, group in df.groupby(self.label_col):
-            X = np.stack(group[self.signal_col].values).astype(np.float32)
-            n_required = self.k_shot + self.q_query
-            if len(X) < n_required:
-                print(f"  [skip] {pool}/class={label} — "
-                      f"only {len(X)} windows, need {n_required}")
+        n_required = self.k_shot + self.q_query
+
+        for label in np.unique(y):
+            idx = np.where(y == label)[0]
+            X_cls = X[idx].astype(np.float32)
+
+            if len(X_cls) < n_required:
+                print(f"  [skip] {pool}/class={self.classes_[label]} — "
+                      f"only {len(X_cls)} windows, need {n_required}")
                 continue
-            class_pool[int(label)] = X
+
+            class_pool[int(label)] = X_cls
+
         return class_pool
 
+
     def _reset_availability(self, split: str):
-        """Shuffle and restore all window indices for a new epoch."""
-        pool = self._meta_train_pool if split == "train" else self._meta_tune_pool
+        pool  = self._meta_train_pool if split == "train" else self._meta_tune_pool
         avail = self._train_available if split == "train" else self._tune_available
         for label, X in pool.items():
             idx = list(range(len(X)))
             random.shuffle(idx)
             avail[label] = idx
 
+
     def _sample_task(
         self,
         pool:      dict[int, np.ndarray],
         available: dict[int, list[int]],
         n_way:     int,
-        split:     str,
     ) -> Task:
-        """
-        Draw one N-way K-shot task.
-        Pops indices from `available` (without replacement).
-        Resets exhausted classes automatically.
-        """
-        # Refresh any class that can no longer fill K+Q windows
         n_required = self.k_shot + self.q_query
+
+        # Refresh any class that can no longer fill k_shot + q_query
         for label in list(available.keys()):
             if len(available[label]) < n_required:
                 idx = list(range(len(pool[label])))
                 random.shuffle(idx)
                 available[label] = idx
 
-        # Sample N classes for this episode
         classes = random.sample(list(pool.keys()), k=n_way)
 
         sup_X_list, sup_y_list = [], []
         qry_X_list, qry_y_list = [], []
 
         for cls in classes:
-            # Pop K + Q indices without replacement
             drawn   = [available[cls].pop() for _ in range(n_required)]
             sup_idx = drawn[:self.k_shot]
             qry_idx = drawn[self.k_shot:]
@@ -198,61 +174,36 @@ class FOMAMLTaskSampler:
             query_y   = torch.tensor(qry_y_list, dtype=torch.long),
         )
 
-    # ── public API ────────────────────────────────────────────────────────────
 
     def sample_meta_train_batch(self, n_tasks: int) -> list[Task]:
-        """
-        Sample n_tasks episodes from the general (subject-agnostic) pool.
-        Indices are consumed without replacement; exhausted classes auto-reset.
-        Call reset_epoch('train') at the top of each meta-epoch to reshuffle.
-        """
         return [
-            self._sample_task(
-                self._meta_train_pool,
-                self._train_available,
-                self._n_way_train,
-                split="train",
-            )
+            self._sample_task(self._meta_train_pool, self._train_available, self._n_way_train)
             for _ in range(n_tasks)
         ]
 
     def sample_meta_tune_batch(self, n_tasks: int = 1) -> list[Task]:
-        """
-        Sample n_tasks episodes from the fine-tune subject pool.
-        """
         return [
-            self._sample_task(
-                self._meta_tune_pool,
-                self._tune_available,
-                self._n_way_tune,
-                split="tune",
-            )
+            self._sample_task(self._meta_tune_pool, self._tune_available, self._n_way_tune)
             for _ in range(n_tasks)
         ]
 
-    def reset_epoch(self, split: str = "train"):
-        """
-        Call at the start of each epoch to reshuffle and restore
-        the without-replacement availability pool.
-
-        Args:
-            split : 'train', 'tune', or 'both'
-        """
+    def reset_epoch(self, split: str = "both"):
+        """Call at the start of each epoch to reshuffle the without-replacement pool."""
         if split in ("train", "both"):
             self._reset_availability("train")
         if split in ("tune", "both"):
             self._reset_availability("tune")
 
+    def decode_labels(self, encoded: torch.Tensor) -> np.ndarray:
+        """Convert integer-encoded labels back to original gesture strings."""
+        return self.classes_[encoded.cpu().numpy()]
+
     @property
     def tasks_per_epoch(self) -> dict[str, int]:
-        """
-        Maximum number of tasks drawable per epoch before any class resets,
-        based on the scarcest class in each pool.
-        """
+        """Max tasks drawable before the scarcest class exhausts."""
         def _min_tasks(pool, n_way):
             min_windows = min(len(v) for v in pool.values())
             return (min_windows // (self.k_shot + self.q_query)) * n_way
-
         return {
             "meta_train": _min_tasks(self._meta_train_pool, self._n_way_train),
             "meta_tune":  _min_tasks(self._meta_tune_pool,  self._n_way_tune),

@@ -576,9 +576,9 @@ def preprocess_mindrove_data(
     }
 
 
-preprocessed = preprocess_mindrove_data(
-    root_dir="mindrove_data",
-    exclude_file_names=[]
-)
+# preprocessed = preprocess_mindrove_data(
+#     root_dir="mindrove_data",
+#     exclude_file_names=[]
+# )
 
-globals().update(preprocessed)
+# globals().update(preprocessed)
