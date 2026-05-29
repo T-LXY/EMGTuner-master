@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix, f1_score
     
+# stole from cnn_lstm no changes
 @torch.no_grad()
 def evaluate(model: nn.Module, dataloader: DataLoader, criterion, device) -> dict:
     """

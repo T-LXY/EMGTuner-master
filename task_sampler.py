@@ -52,7 +52,7 @@ class Task:
 # ─────────────────────────────────────────────
 class FOMAMLTaskSampler:
     """
-    N-way K-shot episodic sampler for FOMAML.
+    N-way K-shot episodic sampler for FOMAML
 
     pre-windowed X/y arrays
     pooled by gesture class

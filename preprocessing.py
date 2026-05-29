@@ -8,6 +8,56 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+def remove_window_dc_offset(X: np.ndarray) -> np.ndarray:
+    """
+    Remove the per-window, per-channel baseline.
+
+    X has shape:
+    (num_windows, window_size, num_channels)
+    """
+    window_mean = np.mean(X, axis=1, keepdims=True)
+    return (X - window_mean).astype(np.float32)
+
+
+def add_delta_features(X: np.ndarray) -> np.ndarray:
+    """
+    Add first-difference features.
+    """
+    delta = np.diff(X, axis=1, prepend=X[:, :1, :])
+    return np.concatenate([X, delta], axis=2).astype(np.float32)
+
+
+def prepare_model_features(X: np.ndarray) -> np.ndarray:
+    """
+    Apply all feature engineering steps before standardization.
+    """
+    X_centered = remove_window_dc_offset(X)
+    X_features = add_delta_features(X_centered)
+    return X_features.astype(np.float32)
+
+
+def fit_channel_standardizer(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Fit a channel-wise standardizer using only the training set.
+    """
+    flat = X.reshape(-1, X.shape[-1])
+
+    mean = np.mean(flat, axis=0)
+    std = np.std(flat, axis=0) + 1e-8
+
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def apply_channel_standardization(
+    X: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray
+) -> np.ndarray:
+    """
+    Apply training-set standardization to train/val/test data.
+    """
+    return ((X - mean[None, None, :]) / std[None, None, :]).astype(np.float32)
+
 
 def preprocess_mindrove_data(
     root_dir: str | Path = "mindrove_data",
@@ -514,6 +564,11 @@ def preprocess_mindrove_data(
 
     X = np.concatenate(X_list, axis=0)
     y = np.concatenate(y_list, axis=0)
+    # Feature engineer X ig
+    X = prepare_model_features(X)
+    mean_std = fit_channel_standardizer(X)
+    X = apply_channel_standardization(X, *mean_std)
+
     files = np.array(file_list)
     subjects = np.array(subject_list)
 
@@ -574,11 +629,3 @@ def preprocess_mindrove_data(
         "window_start_indices": window_start_indices,
         "make_windows_from_segment": make_windows_from_segment,
     }
-
-
-# preprocessed = preprocess_mindrove_data(
-#     root_dir="mindrove_data",
-#     exclude_file_names=[]
-# )
-
-# globals().update(preprocessed)
